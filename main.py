@@ -5,7 +5,7 @@ import httpx
 import os
 from datetime import datetime
 from sqlalchemy import create_engine, Column, Integer, String, DateTime
-from sqlalchemy.orm import sessionmaker, Session # <-- AGREGAMOS Session ACÁ
+from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy.ext.declarative import declarative_base
 
 # --- CONFIGURACIÓN GENERAL ---
@@ -32,7 +32,7 @@ class Client(Base):
 class LogEvent(Base):
     __tablename__ = "events"
     id = Column(Integer, primary_key=True, index=True)
-    tenant_name = Column(String, index=True) 
+    tenant_id = Column(String, index=True) # <-- CORREGIDO: Vuelve a ser tenant_id
     message = Column(String)
     timestamp = Column(DateTime, default=datetime.utcnow)
 
@@ -51,7 +51,7 @@ def get_db():
     finally:
         db.close()
 
-# 🛡️ SEGURIDAD: Usamos : Session en vez de : SessionLocal
+# 🛡️ SEGURIDAD
 def verify_api_key(x_api_key: str = Header(None), db: Session = Depends(get_db)):
     if not x_api_key:
         raise HTTPException(status_code=401, detail="API Key faltante")
@@ -92,7 +92,7 @@ async def ingest_logs(
     try:
         for entry in payload:
             new_event = LogEvent(
-                tenant_name=client.name, 
+                tenant_id=client.name, # <-- CORREGIDO: Usamos tenant_id
                 message=entry.message,
                 timestamp=datetime.utcnow()
             )
