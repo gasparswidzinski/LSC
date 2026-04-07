@@ -3,3 +3,5 @@ uvicorn
 pydantic
 python-dotenv
 httpx
+sqlalchemy
+psycopg2-binary
