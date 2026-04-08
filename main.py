@@ -4,7 +4,7 @@ from typing import List
 import httpx
 import os
 from datetime import datetime
-from sqlalchemy import create_engine, Column, Integer, String, DateTime
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean
 from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy.ext.declarative import declarative_base
 
@@ -28,6 +28,7 @@ class Client(Base):
     api_key = Column(String, unique=True, index=True)
     last_seen = Column(DateTime, default=datetime.utcnow)
     telegram_chat_id = Column(String, nullable=True) 
+    is_active = Column(Boolean, default=True)
 
 # Tabla de Eventos (La Bóveda)
 class LogEvent(Base):
@@ -53,12 +54,19 @@ def get_db():
         db.close()
 
 # 🛡️ SEGURIDAD
-def verify_api_key(x_api_key: str = Header(None), db: Session = Depends(get_db)):
+async def verify_api_key(x_api_key: str = Header(None), db: Session = Depends(get_db)):
     if not x_api_key:
-        raise HTTPException(status_code=401, detail="API Key faltante")
+        raise HTTPException(status_code=403, detail="Falta API Key")
+        
     client = db.query(Client).filter(Client.api_key == x_api_key).first()
+    
     if not client:
-        raise HTTPException(status_code=401, detail="API Key inválida (Error 401)")
+        raise HTTPException(status_code=403, detail="API Key inválida")
+    
+    # EL BLINDAJE: Si el cliente existe pero no está activo, rechazamos el pedido
+    if not client.is_active:
+        raise HTTPException(status_code=403, detail="Suscripción inactiva. Contacte al administrador.")
+        
     return client
 
 
