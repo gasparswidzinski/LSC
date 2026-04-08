@@ -67,9 +67,14 @@ async def send_telegram_msg(chat_id: str, text: str):
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {"chat_id": chat_id, "text": text}
     try:
-        requests.post(url, json=payload)
+        # 1. Guardamos lo que nos responde Telegram en una variable
+        response = requests.post(url, json=payload)
+        
+        # 2. Obligamos a Python a imprimir el texto exacto de la respuesta en la consola
+        print(f"Respuesta de Telegram para el chat {chat_id}: {response.text}")
+        
     except Exception as e:
-        print(f"Error enviando telegram: {e}")
+        print(f"Error interno enviando telegram: {e}")
 
 @app.get("/setup-demo")
 def setup_demo(db: Session = Depends(get_db)):
