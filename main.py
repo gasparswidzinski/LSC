@@ -66,7 +66,7 @@ async def send_telegram_msg(chat_id: str, text: str):
     import requests, os
     
     # 1. Recuperamos el token (asegurándote de usar el nombre correcto en Railway)
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    token = os.getenv("TELEGRAM_TOKEN")
     if not token:
         print("[ERROR] TELEGRAM_BOT_TOKEN no configurado en las variables de entorno.")
         return
