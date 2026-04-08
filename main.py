@@ -26,7 +26,8 @@ class Client(Base):
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String)
     api_key = Column(String, unique=True, index=True)
-    last_seen = Column(DateTime, default=datetime.utcnow) 
+    last_seen = Column(DateTime, default=datetime.utcnow)
+    telegram_chat_id = Column(String, nullable=True) 
 
 # Tabla de Eventos (La Bóveda)
 class LogEvent(Base):
