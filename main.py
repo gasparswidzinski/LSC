@@ -64,18 +64,27 @@ def verify_api_key(x_api_key: str = Header(None), db: Session = Depends(get_db))
 
 async def send_telegram_msg(chat_id: str, text: str):
     import requests, os
-    token = os.getenv("TELEGRAM_TOKEN")
+    
+    # 1. Recuperamos el token (asegurándote de usar el nombre correcto en Railway)
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not token:
+        print("[ERROR] TELEGRAM_BOT_TOKEN no configurado en las variables de entorno.")
+        return
+
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {"chat_id": chat_id, "text": text}
+
     try:
-        # 1. Guardamos lo que nos responde Telegram en una variable
-        response = requests.post(url, json=payload)
+        # 2. Enviamos el mensaje con un timeout de 10 segundos
+        response = requests.post(url, json=payload, timeout=10)
         
-        # 2. Obligamos a Python a imprimir el texto exacto de la respuesta en la consola
-        print(f"Respuesta de Telegram para el chat {chat_id}: {response.text}")
-        
+        # 3. Solo imprimimos si hay un error real (para auditoría interna)
+        if not response.ok:
+            print(f"[Telegram Error] ID: {chat_id} | Status: {response.status_code} | Msg: {response.text}")
+            
     except Exception as e:
-        print(f"Error interno enviando telegram: {e}")
+        # 4. Fallo de red o conexión
+        print(f"[Critical Error] Falló el despacho a Telegram: {e}")
 
 @app.get("/setup-demo")
 def setup_demo(db: Session = Depends(get_db)):
