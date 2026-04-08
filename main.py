@@ -61,6 +61,7 @@ def verify_api_key(x_api_key: str = Header(None), db: Session = Depends(get_db))
         raise HTTPException(status_code=401, detail="API Key inválida (Error 401)")
     return client
 
+
 async def send_telegram_msg(chat_id: str, text: str):
     import requests, os
     token = os.getenv("TELEGRAM_BOT_TOKEN")
