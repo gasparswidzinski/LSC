@@ -64,7 +64,7 @@ def verify_api_key(x_api_key: str = Header(None), db: Session = Depends(get_db))
 
 async def send_telegram_msg(chat_id: str, text: str):
     import requests, os
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    token = os.getenv("TELEGRAM_TOKEN")
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {"chat_id": chat_id, "text": text}
     try:
