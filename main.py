@@ -60,11 +60,15 @@ def verify_api_key(x_api_key: str = Header(None), db: Session = Depends(get_db))
         raise HTTPException(status_code=401, detail="API Key inválida (Error 401)")
     return client
 
-async def send_telegram_msg(text: str):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
-    async with httpx.AsyncClient() as client:
-        await client.post(url, json=payload)
+async def send_telegram_msg(chat_id: str, text: str):
+    import requests, os
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text}
+    try:
+        requests.post(url, json=payload)
+    except Exception as e:
+        print(f"Error enviando telegram: {e}")
 
 @app.get("/setup-demo")
 def setup_demo(db: Session = Depends(get_db)):
@@ -92,15 +96,26 @@ async def ingest_logs(
     try:
         for entry in payload:
             new_event = LogEvent(
-                tenant_id=client.name, # <-- CORREGIDO: Usamos tenant_id
+                tenant_id=client.name, 
                 message=entry.message,
                 timestamp=datetime.utcnow()
             )
             db.add(new_event)
             
-            if "FAILED" in entry.message.upper() or "ERROR" in entry.message.upper():
+            if "FAILED" in entry.message.upper() or "ERROR" in entry.message.upper() or "4625" in entry.message:
                 msg = f"⚠️ [ALERTA LSC] Empresa: {client.name}\nEvento:\n{entry.message}"
-                background_tasks.add_task(send_telegram_msg, msg)
+                
+                # --- NUEVA LÓGICA DE RUTEO ---
+                # Verifica si el cliente tiene un chat_id propio en la base de datos
+                # Si no tiene (o da error al buscarlo), usa la variable de entorno global por defecto
+                import os
+                admin_chat_id = os.getenv("TELEGRAM_CHAT_ID") 
+                destino_id = getattr(client, 'telegram_chat_id', admin_chat_id) 
+                if not destino_id: 
+                    destino_id = admin_chat_id
+                
+                # Ahora le pasamos DOS parámetros a la tarea: el ID del destino y el mensaje
+                background_tasks.add_task(send_telegram_msg, destino_id, msg)
         
         db.commit()
     except Exception as e:
