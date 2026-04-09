@@ -8,10 +8,13 @@ from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean
 from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy.ext.declarative import declarative_base
 from protocols import *
+from fastapi import Request
+
 
 # --- CONFIGURACIÓN GENERAL ---
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+MP_ACCESS_TOKEN = os.getenv("MP_ACCESS_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
@@ -163,3 +166,49 @@ async def ingest_logs(
         raise HTTPException(status_code=500, detail="Error de BD")
         
     return {"status": "saved", "tenant": client.name}
+
+@app.post("/v1/webhooks/mercadopago")
+async def mercadopago_webhook(request: Request, db: Session = Depends(get_db)):
+    """
+    El Teléfono Rojo: Recibe notificaciones de Mercado Pago
+    """
+    # 1. Capturamos lo que nos manda MP
+    payload = await request.json()
+    
+    # 2. MP nos avisa que se creó o actualizó un pago
+    if payload.get("type") == "payment" or payload.get("action") == "payment.created":
+        payment_id = payload.get("data", {}).get("id")
+        
+        if payment_id and MP_ACCESS_TOKEN:
+            # 3. Verificación de Seguridad: Le preguntamos a MP si este pago es real
+            import requests
+            headers = {"Authorization": f"Bearer {MP_ACCESS_TOKEN}"}
+            mp_url = f"https://api.mercadopago.com/v1/payments/{payment_id}"
+            
+            response = requests.get(mp_url, headers=headers)
+            
+            if response.status_code == 200:
+                payment_data = response.json()
+                
+                # Obtenemos el estado (approved, rejected, pending)
+                status = payment_data.get("status") 
+                
+                # Obtenemos la llave de nuestro cliente (La magia)
+                api_key_cliente = payment_data.get("external_reference") 
+                
+                # 4. Actualizamos la Base de Datos
+                if api_key_cliente:
+                    cliente = db.query(Client).filter(Client.api_key == api_key_cliente).first()
+                    
+                    if cliente:
+                        if status == "approved":
+                            cliente.is_active = True
+                            print(f"💰 [COBRANZA] Pago aprobado. {cliente.name} ACTIVADO.")
+                        elif status in ["rejected", "cancelled", "refunded"]:
+                            cliente.is_active = False
+                            print(f"❌ [COBRANZA] Pago fallido/cancelado. {cliente.name} DESACTIVADO.")
+                        
+                        db.commit()
+
+    # 5. Regla de Oro de MP: Siempre devolver 200 OK rápido, sino reintentan llamar mil veces.
+    return {"status": "ok"}
