@@ -7,6 +7,7 @@ from datetime import datetime
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean
 from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy.ext.declarative import declarative_base
+from protocols import *
 
 # --- CONFIGURACIÓN GENERAL ---
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -117,6 +118,9 @@ async def ingest_logs(
     client: Client = Depends(verify_api_key), 
     db: Session = Depends(get_db)
 ):
+    # --- IMPORTAMOS EL MANUAL DE FRANQUICIA (SOP) ---
+    from protocols import get_protocol 
+
     try:
         for entry in payload:
             new_event = LogEvent(
@@ -126,20 +130,32 @@ async def ingest_logs(
             )
             db.add(new_event)
             
-            if "FAILED" in entry.message.upper() or "ERROR" in entry.message.upper() or "4625" in entry.message:
-                msg = f"⚠️ [ALERTA LSC] Empresa: {client.name}\nEvento:\n{entry.message}"
+            # Como el agente V2 ya filtra la basura, todo lo que llega con "ID" es alerta.
+            if "ID " in entry.message or "4625" in entry.message:
                 
-                # --- NUEVA LÓGICA DE RUTEO ---
-                # Verifica si el cliente tiene un chat_id propio en la base de datos
-                # Si no tiene (o da error al buscarlo), usa la variable de entorno global por defecto
+                # 1. El Cerebro: Buscamos qué hacer según el evento
+                protocol = get_protocol(entry.message)
+                steps_formatted = "\n".join(protocol["action_steps"])
+                
+                # 2. El Mensaje SSO (Standard Service Offering)
+                msg_final = (
+                    f"{protocol['title']}\n"
+                    f"🏢 Empresa: {client.name}\n"
+                    f"⚡ Prioridad: {protocol['urgency']}\n\n"
+                    f"🛠️ PASOS A SEGUIR:\n{steps_formatted}\n\n"
+                    f"--- Detalles Técnicos ---\n"
+                    f"{entry.message[:150]}..."
+                )
+                
+                # 3. Ruteo Automático
                 import os
                 admin_chat_id = os.getenv("TELEGRAM_CHAT_ID") 
                 destino_id = getattr(client, 'telegram_chat_id', admin_chat_id) 
                 if not destino_id: 
                     destino_id = admin_chat_id
                 
-                # Ahora le pasamos DOS parámetros a la tarea: el ID del destino y el mensaje
-                background_tasks.add_task(send_telegram_msg, destino_id, msg)
+                # 4. Disparo asíncrono
+                background_tasks.add_task(send_telegram_msg, destino_id, msg_final)
         
         db.commit()
     except Exception as e:
