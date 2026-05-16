@@ -15,6 +15,7 @@ Sprint 4:
 from __future__ import annotations
 
 import re
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 
@@ -103,6 +104,26 @@ RESPONSE_PROTOCOLS: Dict[str, Dict[str, Any]] = {
         "note": (
             "LSC solo monitoreó y notificó estos eventos. "
             "No bloqueó IPs, usuarios ni modificó el firewall."
+        ),
+    },
+    "4625_BURST_LOCAL": {
+        "title": "🟥 LSC | ALERTA CRÍTICA: INTENTOS FALLIDOS REITERADOS",
+        "urgency": "CRÍTICA",
+        "what_detected": (
+            "Se detectó un volumen elevado de intentos fallidos de inicio de sesión originados localmente "
+            "o desde el propio equipo. Esta actividad puede deberse a intentos reiterados de acceso no exitosos, "
+            "credenciales locales mal ingresadas, un servicio con credenciales incorrectas o actividad no autorizada."
+        ),
+        "action_steps": [
+            "Verifique si los intentos corresponden a pruebas o accesos legítimos.",
+            "Revise usuario objetivo, proceso involucrado y horario de los intentos.",
+            "Controle servicios o credenciales guardadas que puedan estar fallando.",
+            "Si el patrón no es reconocido, contacte a su técnico de confianza.",
+        ],
+        "technical_detail": "Evento Windows ID 4625: volumen elevado de errores locales de inicio de sesión.",
+        "note": (
+            "LSC solo monitoreó y notificó estos eventos. "
+            "No bloqueó usuarios, IPs ni modificó la configuración del servidor."
         ),
     },
     "1116": {
@@ -401,7 +422,7 @@ def _extract_labeled_value(text: str, labels: List[str]) -> Optional[str]:
 
 
 def _build_4625_protocol(base_key: str, parsed: Dict[str, Optional[str]]) -> Dict[str, Any]:
-    if base_key in {"4625_BURST", "4625_BURST_HIGH"}:
+    if base_key in {"4625_BURST", "4625_BURST_HIGH", "4625_BURST_LOCAL"}:
         return RESPONSE_PROTOCOLS[base_key]
 
     logon_type = parsed.get("logon_type")
@@ -439,21 +460,79 @@ def get_protocol(event_message: str) -> Dict[str, Any]:
     return get_protocol_by_id(event_message)
 
 
-def _format_count_line(entry: Any) -> Optional[str]:
-    count = _entry_get(entry, "failed_login_count")
-    if not count:
+def _parse_iso_datetime(value: Any) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except Exception:
         return None
 
-    window_seconds = _entry_get(entry, "window_seconds")
-    if window_seconds:
-        minutes = round(float(window_seconds) / 60, 1)
-        if minutes.is_integer():
-            minutes_text = f"{int(minutes)} minuto(s)"
-        else:
-            minutes_text = f"{minutes} minuto(s)"
-        return f"Intentos detectados: {count} en {minutes_text}"
 
-    return f"Intentos detectados: {count}"
+def _format_seconds(seconds: float) -> str:
+    seconds = max(0, int(round(seconds)))
+    if seconds < 60:
+        return f"{seconds} segundo(s)"
+
+    minutes = seconds / 60
+    if minutes < 60:
+        if abs(minutes - round(minutes)) < 0.05:
+            return f"{int(round(minutes))} minuto(s)"
+        return f"{minutes:.1f} minuto(s)"
+
+    hours = minutes / 60
+    if abs(hours - round(hours)) < 0.05:
+        return f"{int(round(hours))} hora(s)"
+    return f"{hours:.1f} hora(s)"
+
+
+def _format_window(seconds_value: Any) -> Optional[str]:
+    if seconds_value is None:
+        return None
+    try:
+        return _format_seconds(float(seconds_value))
+    except Exception:
+        return None
+
+
+def _format_count_lines(entry: Any) -> List[str]:
+    """
+    Para eventos agregados:
+    - Muestra cantidad total.
+    - Muestra duración real entre primer y último evento.
+    - Muestra ventana evaluada por separado.
+    Para un único 4625 aislado, evita mostrar "1 en 0.2 minuto(s)".
+    """
+    count = _entry_get(entry, "failed_login_count")
+    if not count:
+        return []
+
+    try:
+        count_int = int(count)
+    except Exception:
+        return []
+
+    protocol_key = _entry_get(entry, "protocol_key")
+    is_burst = protocol_key in {"4625_BURST", "4625_BURST_HIGH", "4625_BURST_LOCAL"}
+
+    if count_int <= 1 and not is_burst:
+        return []
+
+    lines = [f"Intentos detectados: {count_int}"]
+
+    first_dt = _parse_iso_datetime(_entry_get(entry, "first_event_time"))
+    last_dt = _parse_iso_datetime(_entry_get(entry, "last_event_time"))
+
+    if first_dt and last_dt:
+        duration = (last_dt - first_dt).total_seconds()
+        if duration > 0:
+            lines.append(f"Duración real: {_format_seconds(duration)}")
+
+    window_text = _format_window(_entry_get(entry, "window_seconds"))
+    if window_text and is_burst:
+        lines.append(f"Ventana evaluada: {window_text}")
+
+    return lines
 
 
 def _build_technical_summary(event_id: Optional[str], entry: Any, raw_message: str, protocol: Dict[str, Any]) -> List[str]:
@@ -463,20 +542,27 @@ def _build_technical_summary(event_id: Optional[str], entry: Any, raw_message: s
 
     lines: List[str] = [protocol["technical_detail"]]
 
-    count_line = _format_count_line(entry)
-    if count_line:
-        lines.append(count_line)
+    count_lines = _format_count_lines(entry)
+    lines.extend(count_lines)
 
-    if _entry_get(entry, "first_event_time"):
+    count = _entry_get(entry, "failed_login_count")
+    protocol_key = _entry_get(entry, "protocol_key")
+    try:
+        count_int = int(count) if count is not None else 0
+    except Exception:
+        count_int = 0
+    show_aggregation_times = count_int > 1 or protocol_key in {"4625_BURST", "4625_BURST_HIGH", "4625_BURST_LOCAL"}
+
+    if show_aggregation_times and _entry_get(entry, "first_event_time"):
         lines.append(f"Primer evento: {_entry_get(entry, 'first_event_time')}")
-    if _entry_get(entry, "last_event_time"):
+    if show_aggregation_times and _entry_get(entry, "last_event_time"):
         lines.append(f"Último evento: {_entry_get(entry, 'last_event_time')}")
 
     if record_id and not protocol_key:
         lines.append(f"Record ID: {record_id}")
 
     if event_id == "4625":
-        if protocol_key in {"4625_BURST", "4625_BURST_HIGH"}:
+        if protocol_key in {"4625_BURST", "4625_BURST_HIGH", "4625_BURST_LOCAL"}:
             logon_type = _entry_get(entry, "logon_type")
             target_user = _entry_get(entry, "target_user")
             source_ip = _entry_get(entry, "source_ip")
@@ -485,7 +571,8 @@ def _build_technical_summary(event_id: Optional[str], entry: Any, raw_message: s
             if logon_type:
                 lines.append(f"Tipo de inicio de sesión: {logon_type} ({_logon_type_description(str(logon_type))})")
             if target_user:
-                lines.append(f"Cuenta objetivo: {target_user}")
+                target_display = "no informada" if str(target_user).strip() == "-" else target_user
+                lines.append(f"Cuenta objetivo: {target_display}")
             if source_ip:
                 lines.append(f"Origen/IP: {source_ip}")
             if isinstance(record_ids, list) and record_ids:

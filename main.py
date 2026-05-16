@@ -60,7 +60,7 @@ class LogEvent(Base):
 
 Base.metadata.create_all(bind=engine)
 
-app = FastAPI(title="Log-Sentinel Cloud API", version="0.9.2-pilot")
+app = FastAPI(title="Log-Sentinel Cloud API", version="0.9.3-pilot")
 
 
 class LogEntry(BaseModel):
