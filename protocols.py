@@ -2,15 +2,17 @@
 """
 Protocolos de respuesta LSC.
 
-Este archivo centraliza el copy técnico-comercial de las alertas.
-Regla de producto: LSC monitorea y notifica. No bloquea, no remedia y no modifica
-configuración del servidor.
+Sprint 3:
+- Mensajes más breves y profesionales.
+- Detalle técnico resumido por tipo de evento.
+- Clasificación mejorada de Event ID 4625 local vs. red/RDP.
+- Corrección defensiva de mojibake frecuente de Windows/PowerShell.
 """
 
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 
 EVENT_IDS = {"4625", "1116", "1117", "4720", "1102"}
@@ -32,10 +34,30 @@ RESPONSE_PROTOCOLS: Dict[str, Dict[str, Any]] = {
         "action_steps": [
             "Verifique si el intento corresponde a un usuario legítimo.",
             "Si el evento se repite varias veces, contacte a su técnico de confianza.",
-            "Revise si el servidor tiene Escritorio Remoto/RDP expuesto a Internet.",
+            "Revise servicios o credenciales guardadas que puedan estar fallando.",
             "No reinicie el equipo ni borre evidencia antes de la revisión técnica.",
         ],
         "technical_detail": "Evento Windows ID 4625: error de inicio de sesión.",
+        "note": (
+            "LSC solo monitoreó y notificó este evento. "
+            "No bloqueó usuarios, IPs ni modificó reglas de firewall."
+        ),
+    },
+    "4625_NETWORK": {
+        "title": "🟧 LSC | ALERTA ALTA: INICIO DE SESIÓN FALLIDO DESDE RED",
+        "urgency": "ALTA",
+        "what_detected": (
+            "Windows registró un intento fallido de inicio de sesión con origen de red. "
+            "Esto puede deberse a un acceso legítimo fallido, credenciales guardadas incorrectas "
+            "o un intento no autorizado contra el servidor."
+        ),
+        "action_steps": [
+            "Verifique si el acceso corresponde a un usuario o técnico autorizado.",
+            "Revise si el servidor tiene Escritorio Remoto/RDP expuesto a Internet.",
+            "Controle usuario objetivo, IP de origen y horario del intento.",
+            "Si el acceso no es esperado, contacte a su técnico de confianza.",
+        ],
+        "technical_detail": "Evento Windows ID 4625: error de inicio de sesión con origen de red.",
         "note": (
             "LSC solo monitoreó y notificó este evento. "
             "No bloqueó usuarios, IPs ni modificó reglas de firewall."
@@ -150,11 +172,51 @@ RESPONSE_PROTOCOLS: Dict[str, Dict[str, Any]] = {
 }
 
 
-def compact_text(value: Optional[str], max_len: int = 900) -> str:
+def repair_mojibake(value: Optional[str]) -> str:
+    """
+    Corrige mojibake frecuente cuando texto OEM/CP850 de Windows se decodifica como CP1252.
+    El agente Sprint 3 ya fuerza UTF-8, pero esto deja compatibilidad con eventos viejos.
+    """
+    if value is None:
+        return ""
+
+    text = str(value)
+
+    replacements = {
+        "sesi¢n": "sesión",
+        "Sesi¢n": "Sesión",
+        "informaci¢n": "información",
+        "Informaci¢n": "Información",
+        "autenticaci¢n": "autenticación",
+        "Autenticaci¢n": "Autenticación",
+        "contrase¤a": "contraseña",
+        "Contrase¤a": "Contraseña",
+        "acci¢n": "acción",
+        "Acci¢n": "Acción",
+        "creaci¢n": "creación",
+        "Creaci¢n": "Creación",
+        "m quina": "máquina",
+        "M quina": "Máquina",
+        "direcci¢n": "dirección",
+        "Direcci¢n": "Dirección",
+        "t‚cnico": "técnico",
+        "T‚cnico": "Técnico",
+        "cr¡tico": "crítico",
+        "Cr¡tico": "Crítico",
+    }
+
+    for bad, good in replacements.items():
+        text = text.replace(bad, good)
+
+    return text
+
+
+def compact_text(value: Optional[str], max_len: int = 450) -> str:
     """Normaliza saltos de línea/espacios y limita longitud para Telegram."""
-    if not value:
+    text = repair_mojibake(value)
+    if not text:
         return "Sin detalle técnico adicional."
-    text = str(value).replace("\r", " ").replace("\n", " ")
+    text = text.replace("\r", " ").replace("\n", " ")
     text = " ".join(text.split())
     if len(text) > max_len:
         return text[: max_len - 3].rstrip() + "..."
@@ -184,11 +246,174 @@ def extract_event_id(value: Any) -> Optional[str]:
         r"\bEvent\s*ID\s*(4625|1116|1117|4720|1102)\b",
         r"\b(4625|1116|1117|4720|1102)\b",
     ]
+
     for pattern in patterns:
         match = re.search(pattern, value, flags=re.IGNORECASE)
         if match:
             return match.group(1)
+
     return None
+
+
+def _entry_get(entry: Any, key: str, default: Any = None) -> Any:
+    if isinstance(entry, dict):
+        return entry.get(key, default)
+    return getattr(entry, key, default)
+
+
+def _find_first(patterns: List[str], text: str) -> Optional[str]:
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+    return None
+
+
+def _all_account_names(text: str) -> List[str]:
+    return re.findall(r"(?:Nombre de cuenta|Account Name)\s*:\s*([^\s]+)", text, flags=re.IGNORECASE)
+
+
+def _logon_type_description(logon_type: Optional[str]) -> str:
+    mapping = {
+        "2": "interactivo/local",
+        "3": "red",
+        "4": "batch",
+        "5": "servicio",
+        "7": "desbloqueo",
+        "8": "red con texto claro",
+        "9": "nuevas credenciales",
+        "10": "RDP/escritorio remoto",
+        "11": "credenciales cacheadas",
+    }
+    if not logon_type:
+        return "no informado"
+    return mapping.get(str(logon_type), "tipo no clasificado")
+
+
+def _is_local_source_ip(source_ip: Optional[str]) -> bool:
+    if not source_ip:
+        return True
+    ip = source_ip.strip().lower()
+    return ip in {"-", "::1", "127.0.0.1", "localhost", "0.0.0.0"}
+
+
+def _parse_4625(raw_message: str) -> Dict[str, Optional[str]]:
+    text = compact_text(raw_message, max_len=5000)
+
+    accounts = _all_account_names(text)
+    target_user = accounts[1] if len(accounts) > 1 else (accounts[0] if accounts else None)
+    subject_user = accounts[0] if accounts else None
+
+    return {
+        "logon_type": _find_first(
+            [
+                r"(?:Tipo de inicio de sesi[oó]n|Tipo de inicio de sesi.n|Logon Type)\s*:\s*([0-9]+)",
+            ],
+            text,
+        ),
+        "target_user": target_user,
+        "subject_user": subject_user,
+        "source_ip": _find_first(
+            [
+                r"(?:Direcci[oó]n de red de origen|Direcci.n de red de origen|Source Network Address)\s*:\s*([^\s]+)",
+            ],
+            text,
+        ),
+        "source_port": _find_first(
+            [
+                r"(?:Puerto de origen|Source Port)\s*:\s*([^\s]+)",
+            ],
+            text,
+        ),
+        "process": _find_first(
+            [
+                r"(?:Nombre de proceso del autor de la llamada|Caller Process Name)\s*:\s*([^\s]+)",
+                r"(?:Nombre de proceso|Process Name)\s*:\s*([^\s]+)",
+            ],
+            text,
+        ),
+    }
+
+
+def _parse_4720(raw_message: str) -> Dict[str, Optional[str]]:
+    text = compact_text(raw_message, max_len=5000)
+    accounts = _all_account_names(text)
+
+    created_user = _find_first(
+        [
+            r"(?:Cuenta nueva|New Account).*?(?:Nombre de cuenta|Account Name)\s*:\s*([^\s]+)",
+        ],
+        text,
+    )
+
+    return {
+        "created_user": created_user or (accounts[-1] if accounts else None),
+        "actor_user": accounts[0] if accounts else None,
+    }
+
+
+def _parse_1102(raw_message: str) -> Dict[str, Optional[str]]:
+    text = compact_text(raw_message, max_len=5000)
+    accounts = _all_account_names(text)
+
+    return {
+        "actor_user": accounts[0] if accounts else None,
+    }
+
+
+def _extract_labeled_value(text: str, labels: List[str]) -> Optional[str]:
+    """
+    Extractor genérico para mensajes de Defender.
+    Se mantiene conservador para evitar inventar datos cuando el evento viene con formato variable.
+    """
+    normalized = compact_text(text, max_len=5000)
+    label_pattern = "|".join(re.escape(label) for label in labels)
+    stop_labels = [
+        "Nombre", "Name", "Amenaza", "Threat", "Id", "ID", "Severidad", "Severity",
+        "Categoría", "Category", "Ruta", "Path", "Archivo", "File", "Acción", "Action",
+        "Estado", "Status", "Usuario", "User", "Proceso", "Process",
+    ]
+    stop_pattern = "|".join(re.escape(label) for label in stop_labels)
+
+    match = re.search(
+        rf"(?:{label_pattern})\s*:\s*(.*?)(?=\s+(?:{stop_pattern})\s*:|$)",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+
+    value = match.group(1).strip()
+    return value if value else None
+
+
+def _build_4625_protocol(base_key: str, parsed: Dict[str, Optional[str]]) -> Dict[str, Any]:
+    if base_key == "4625_BURST":
+        return RESPONSE_PROTOCOLS["4625_BURST"]
+
+    logon_type = parsed.get("logon_type")
+    source_ip = parsed.get("source_ip")
+
+    # Si hay origen de red no local, o Logon Type 10/3, lo subimos a ALTA.
+    if (source_ip and not _is_local_source_ip(source_ip)) or logon_type in {"3", "10"}:
+        return RESPONSE_PROTOCOLS["4625_NETWORK"]
+
+    return RESPONSE_PROTOCOLS["4625"]
+
+
+def _select_protocol(event_id: Optional[str], entry: Any, raw_message: str) -> Dict[str, Any]:
+    protocol_key = _entry_get(entry, "protocol_key")
+    if protocol_key and protocol_key in RESPONSE_PROTOCOLS:
+        return RESPONSE_PROTOCOLS[protocol_key]
+
+    if event_id == "4625":
+        parsed = _parse_4625(raw_message)
+        return _build_4625_protocol("4625", parsed)
+
+    if event_id and event_id in RESPONSE_PROTOCOLS:
+        return RESPONSE_PROTOCOLS[event_id]
+
+    return RESPONSE_PROTOCOLS["DEFAULT"]
 
 
 def get_protocol_by_id(event_id: Optional[Any]) -> Dict[str, Any]:
@@ -199,16 +424,79 @@ def get_protocol_by_id(event_id: Optional[Any]) -> Dict[str, Any]:
 
 
 def get_protocol(event_message: str) -> Dict[str, Any]:
-    """
-    Compatibilidad con el backend anterior: recibe un mensaje y devuelve el protocolo.
-    """
+    """Compatibilidad con el backend anterior."""
     return get_protocol_by_id(event_message)
 
 
-def _entry_get(entry: Any, key: str, default: Any = None) -> Any:
-    if isinstance(entry, dict):
-        return entry.get(key, default)
-    return getattr(entry, key, default)
+def _build_technical_summary(event_id: Optional[str], entry: Any, raw_message: str, protocol: Dict[str, Any]) -> List[str]:
+    source = _entry_get(entry, "source") or _entry_get(entry, "log_name") or "Windows Event Log"
+    record_id = _entry_get(entry, "record_id")
+
+    lines: List[str] = [protocol["technical_detail"]]
+
+    if record_id:
+        lines.append(f"Record ID: {record_id}")
+
+    if event_id == "4625":
+        parsed = _parse_4625(raw_message)
+
+        logon_type = parsed.get("logon_type")
+        if logon_type:
+            lines.append(f"Tipo de inicio de sesión: {logon_type} ({_logon_type_description(logon_type)})")
+
+        if parsed.get("target_user"):
+            lines.append(f"Cuenta objetivo: {parsed['target_user']}")
+
+        if parsed.get("source_ip"):
+            lines.append(f"Origen/IP: {parsed['source_ip']}")
+
+        if parsed.get("source_port") and parsed["source_port"] != "0":
+            lines.append(f"Puerto origen: {parsed['source_port']}")
+
+        if parsed.get("process"):
+            lines.append(f"Proceso: {parsed['process']}")
+
+        return lines
+
+    if event_id == "4720":
+        parsed = _parse_4720(raw_message)
+        if parsed.get("created_user"):
+            lines.append(f"Cuenta creada: {parsed['created_user']}")
+        if parsed.get("actor_user"):
+            lines.append(f"Usuario que realizó la acción: {parsed['actor_user']}")
+        lines.append(f"Origen: {source}")
+        return lines
+
+    if event_id == "1102":
+        parsed = _parse_1102(raw_message)
+        if parsed.get("actor_user"):
+            lines.append(f"Usuario que realizó la acción: {parsed['actor_user']}")
+        lines.append(f"Origen: {source}")
+        return lines
+
+    if event_id in {"1116", "1117"}:
+        threat = _extract_labeled_value(raw_message, ["Amenaza", "Threat", "Nombre", "Name"])
+        path = _extract_labeled_value(raw_message, ["Ruta", "Path", "Archivo", "File"])
+        action = _extract_labeled_value(raw_message, ["Acción", "Action", "Estado", "Status"])
+
+        if threat:
+            lines.append(f"Amenaza/elemento: {compact_text(threat, max_len=160)}")
+        if path:
+            lines.append(f"Ruta/archivo: {compact_text(path, max_len=180)}")
+        if action:
+            lines.append(f"Acción/estado informado: {compact_text(action, max_len=160)}")
+
+        lines.append(f"Origen: {source}")
+
+        # Si no pudimos extraer campos útiles, agregamos un extracto breve, no el texto completo.
+        if len(lines) <= (3 if record_id else 2):
+            lines.append(f"Extracto: {compact_text(raw_message, max_len=300)}")
+
+        return lines
+
+    lines.append(f"Origen: {source}")
+    lines.append(f"Extracto: {compact_text(raw_message, max_len=300)}")
+    return lines
 
 
 def format_alert(entry: Any, client_name: str) -> str:
@@ -216,21 +504,16 @@ def format_alert(entry: Any, client_name: str) -> str:
     Construye una alerta profesional para Telegram.
     Acepta dict, Pydantic model o cualquier objeto con atributos equivalentes.
     """
-    event_id = extract_event_id(_entry_get(entry, "event_id") or _entry_get(entry, "message") or _entry_get(entry, "raw_message"))
-    protocol = get_protocol_by_id(event_id)
+    raw_message = repair_mojibake(_entry_get(entry, "raw_message") or _entry_get(entry, "message") or "")
+    event_id = extract_event_id(_entry_get(entry, "event_id") or _entry_get(entry, "message") or raw_message)
+    protocol = _select_protocol(event_id, entry, raw_message)
 
     hostname = _entry_get(entry, "hostname") or "No informado"
     event_time = _entry_get(entry, "event_time") or _entry_get(entry, "timestamp") or "No informado"
-    source = _entry_get(entry, "source") or _entry_get(entry, "log_name") or "Windows Event Log"
-    raw_message = _entry_get(entry, "raw_message") or _entry_get(entry, "message") or ""
-    record_id = _entry_get(entry, "record_id")
 
     steps = "\n".join(f"{idx}. {step}" for idx, step in enumerate(protocol["action_steps"], start=1))
-    detail_lines = [protocol["technical_detail"]]
-    if record_id:
-        detail_lines.append(f"Record ID: {record_id}")
-    detail_lines.append(f"Origen: {source}")
-    detail_lines.append(compact_text(raw_message, max_len=750))
+    detail_lines = _build_technical_summary(event_id, entry, raw_message, protocol)
+    technical_block = "\n".join(detail_lines)
 
     return (
         f"{protocol['title']}\n\n"
@@ -243,7 +526,7 @@ def format_alert(entry: Any, client_name: str) -> str:
         f"🛠️ Acción recomendada:\n"
         f"{steps}\n\n"
         f"🔎 Detalle técnico:\n"
-        f"{' '.join(detail_lines)}\n\n"
+        f"{technical_block}\n\n"
         f"ℹ️ Nota:\n"
         f"{protocol['note']}"
     )
