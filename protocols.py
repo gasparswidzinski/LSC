@@ -176,7 +176,7 @@ RESPONSE_PROTOCOLS: Dict[str, Dict[str, Any]] = {
         "what_detected": "Se registró la creación de una nueva cuenta de usuario en el sistema.",
         "action_steps": [
             "Verifique si su técnico o administrador creó esta cuenta.",
-            "Si el cambio no fue autorizado, contacte soporte técnico de inmediato.",
+            "Si el cambio no fue autorizado, contacte de inmediato a su técnico de confianza.",
             "Revise permisos, grupos de administrador y accesos recientes.",
             "No elimine evidencia antes de que el técnico revise el evento.",
         ],
@@ -403,9 +403,11 @@ def _extract_labeled_value(text: str, labels: List[str]) -> Optional[str]:
     normalized = compact_text(text, max_len=5000)
     label_pattern = "|".join(re.escape(label) for label in labels)
     stop_labels = [
-        "Nombre", "Name", "Amenaza", "Threat", "Id", "ID", "Severidad", "Severity",
-        "Categoría", "Category", "Ruta", "Path", "Archivo", "File", "Acción", "Action",
-        "Estado", "Status", "Usuario", "User", "Proceso", "Process",
+        "Nombre", "Name", "Amenaza", "Threat", "Id", "ID", "Id.", "Severidad", "Severity",
+        "Gravedad", "Categoría", "Category", "Ruta", "Path", "Archivo", "File",
+        "Acción", "Action", "Estado", "Status", "Usuario", "User", "Proceso", "Process",
+        "Origen de detección", "Detection Origin", "Tipo de detección", "Detection Type",
+        "Origen", "Source",
     ]
     stop_pattern = "|".join(re.escape(label) for label in stop_labels)
 
@@ -419,6 +421,94 @@ def _extract_labeled_value(text: str, labels: List[str]) -> Optional[str]:
 
     value = match.group(1).strip()
     return value if value else None
+
+
+def _strip_defender_resource_noise(value: Optional[str]) -> Optional[str]:
+    """
+    Algunos mensajes de Defender pueden traer ruido de recursos/localización en formato mixto
+    después de la ruta, por ejemplo: %ŋ %ťÐēтėćţîōп...
+    Para Telegram dejamos solo la parte accionable.
+    """
+    if not value:
+        return None
+
+    cleaned = compact_text(value, max_len=1000)
+
+    # Cortes por etiquetas normales.
+    cut_markers = [
+        " Origen de detección:",
+        " Tipo de detección:",
+        " Origen:",
+        " Usuario:",
+        " Proceso:",
+        " Detection Origin:",
+        " Detection Type:",
+        " Source:",
+        " User:",
+        " Process:",
+    ]
+
+    for marker in cut_markers:
+        idx = cleaned.lower().find(marker.lower())
+        if idx != -1:
+            cleaned = cleaned[:idx].strip()
+
+    # Cortes por ruido de recursos de Windows/Defender.
+    percent_idx = cleaned.find("%")
+    if percent_idx != -1:
+        cleaned = cleaned[:percent_idx].strip()
+
+    # Limpieza de prefijos frecuentes.
+    cleaned = cleaned.replace("file:_", "")
+    cleaned = cleaned.replace("file:", "")
+    cleaned = cleaned.strip("_ ").strip()
+
+    return cleaned or None
+
+
+def _extract_defender_threat(text: str) -> Optional[str]:
+    normalized = compact_text(text, max_len=5000)
+
+    patterns = [
+        r"(?:Nombre|Name|Amenaza|Threat)\s*:\s*(.*?)(?=\s+(?:Id\.?|ID|Gravedad|Severidad|Severity|Categoría|Category|Ruta|Path|Archivo|File|Acción|Action|Estado|Status|Origen de detección|Detection Origin)\s*:|$)",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, normalized, flags=re.IGNORECASE)
+        if match:
+            return _strip_defender_resource_noise(match.group(1))
+
+    return None
+
+
+def _extract_defender_path(text: str) -> Optional[str]:
+    normalized = compact_text(text, max_len=5000)
+
+    patterns = [
+        r"(?:Ruta|Path|Archivo|File)\s*:\s*(.*?)(?=\s+(?:Origen de detección|Detection Origin|Tipo de detección|Detection Type|Usuario|User|Proceso|Process|Acción|Action|Estado|Status)\s*:|$)",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, normalized, flags=re.IGNORECASE)
+        if match:
+            return _strip_defender_resource_noise(match.group(1))
+
+    return None
+
+
+def _extract_defender_action(text: str) -> Optional[str]:
+    normalized = compact_text(text, max_len=5000)
+
+    patterns = [
+        r"(?:Acción|Action|Estado|Status)\s*:\s*(.*?)(?=\s+(?:Nombre|Name|Amenaza|Threat|Ruta|Path|Archivo|File|Usuario|User|Proceso|Process|Origen|Source)\s*:|$)",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, normalized, flags=re.IGNORECASE)
+        if match:
+            return _strip_defender_resource_noise(match.group(1))
+
+    return None
 
 
 def _build_4625_protocol(base_key: str, parsed: Dict[str, Optional[str]]) -> Dict[str, Any]:
@@ -622,9 +712,9 @@ def _build_technical_summary(event_id: Optional[str], entry: Any, raw_message: s
         return lines
 
     if event_id in {"1116", "1117"}:
-        threat = _extract_labeled_value(raw_message, ["Amenaza", "Threat", "Nombre", "Name"])
-        path = _extract_labeled_value(raw_message, ["Ruta", "Path", "Archivo", "File"])
-        action = _extract_labeled_value(raw_message, ["Acción", "Action", "Estado", "Status"])
+        threat = _extract_defender_threat(raw_message)
+        path = _extract_defender_path(raw_message)
+        action = _extract_defender_action(raw_message)
 
         if threat:
             lines.append(f"Amenaza/elemento: {compact_text(threat, max_len=160)}")
@@ -635,8 +725,10 @@ def _build_technical_summary(event_id: Optional[str], entry: Any, raw_message: s
 
         lines.append(f"Origen: {source}")
 
+        # Si no pudimos extraer campos útiles, agregamos un extracto breve, no el texto completo.
         if len(lines) <= (3 if record_id else 2):
-            lines.append(f"Extracto: {compact_text(raw_message, max_len=300)}")
+            sanitized_extract = _strip_defender_resource_noise(raw_message) or compact_text(raw_message, max_len=300)
+            lines.append(f"Extracto: {compact_text(sanitized_extract, max_len=300)}")
 
         return lines
 
