@@ -2,11 +2,14 @@
 """
 Protocolos de respuesta LSC.
 
-Sprint 3:
-- Mensajes más breves y profesionales.
-- Detalle técnico resumido por tipo de evento.
-- Clasificación mejorada de Event ID 4625 local vs. red/RDP.
-- Corrección defensiva de mojibake frecuente de Windows/PowerShell.
+Sprint 4:
+- Mantiene alertas profesionales.
+- Agrega soporte para agrupación inteligente de Event ID 4625.
+- Distingue:
+  - 4625 local/aislado = MEDIA
+  - 4625 red/RDP = ALTA
+  - 5+ intentos en 2 minutos = ALTA agregada
+  - 15+ intentos en 5 minutos = CRÍTICA agregada
 """
 
 from __future__ import annotations
@@ -33,7 +36,7 @@ RESPONSE_PROTOCOLS: Dict[str, Dict[str, Any]] = {
         ),
         "action_steps": [
             "Verifique si el intento corresponde a un usuario legítimo.",
-            "Si el evento se repite varias veces, contacte a su técnico de confianza.",
+            "Si el evento se repite o no reconoce el intento de acceso, contacte a su técnico de confianza.",
             "Revise servicios o credenciales guardadas que puedan estar fallando.",
             "No reinicie el equipo ni borre evidencia antes de la revisión técnica.",
         ],
@@ -63,12 +66,32 @@ RESPONSE_PROTOCOLS: Dict[str, Dict[str, Any]] = {
             "No bloqueó usuarios, IPs ni modificó reglas de firewall."
         ),
     },
+    "4625_BURST_HIGH": {
+        "title": "🟧 LSC | ALERTA ALTA: MÚLTIPLES INTENTOS FALLIDOS DE ACCESO",
+        "urgency": "ALTA",
+        "what_detected": (
+            "Se detectaron varios intentos fallidos de inicio de sesión en un período corto. "
+            "Esta actividad requiere revisión técnica, especialmente si el origen o la cuenta objetivo "
+            "no son reconocidos."
+        ),
+        "action_steps": [
+            "Verifique si los intentos corresponden a un usuario o técnico autorizado.",
+            "Revise usuario objetivo, IP de origen y horario de los intentos.",
+            "Controle si el servidor tiene Escritorio Remoto/RDP expuesto a Internet.",
+            "Si el acceso no es esperado, contacte a su técnico de confianza.",
+        ],
+        "technical_detail": "Evento Windows ID 4625: múltiples errores de inicio de sesión detectados.",
+        "note": (
+            "LSC solo monitoreó y notificó estos eventos. "
+            "No bloqueó IPs, usuarios ni modificó el firewall."
+        ),
+    },
     "4625_BURST": {
-        "title": "🟥 LSC | ALERTA CRÍTICA: MÚLTIPLES INTENTOS FALLIDOS DE ACCESO",
+        "title": "🟥 LSC | ALERTA CRÍTICA: POSIBLE FUERZA BRUTA O ACCESO NO AUTORIZADO",
         "urgency": "CRÍTICA",
         "what_detected": (
-            "Se detectaron múltiples intentos fallidos de inicio de sesión en un período corto. "
-            "Esta actividad puede ser compatible con fuerza bruta o intento de acceso no autorizado."
+            "Se detectó un volumen elevado de intentos fallidos de inicio de sesión en un período corto. "
+            "Esta actividad es compatible con fuerza bruta o intento de acceso no autorizado."
         ),
         "action_steps": [
             "Contacte de inmediato a su técnico de confianza.",
@@ -76,9 +99,9 @@ RESPONSE_PROTOCOLS: Dict[str, Dict[str, Any]] = {
             "Revise usuario objetivo, IP de origen y horario de los intentos.",
             "Si el acceso no es esperado, evalúe aislar temporalmente el equipo o restringir RDP.",
         ],
-        "technical_detail": "Evento Windows ID 4625: múltiples errores de inicio de sesión detectados.",
+        "technical_detail": "Evento Windows ID 4625: volumen elevado de errores de inicio de sesión.",
         "note": (
-            "LSC solo monitoreó y notificó este evento. "
+            "LSC solo monitoreó y notificó estos eventos. "
             "No bloqueó IPs, usuarios ni modificó el firewall."
         ),
     },
@@ -173,10 +196,6 @@ RESPONSE_PROTOCOLS: Dict[str, Dict[str, Any]] = {
 
 
 def repair_mojibake(value: Optional[str]) -> str:
-    """
-    Corrige mojibake frecuente cuando texto OEM/CP850 de Windows se decodifica como CP1252.
-    El agente Sprint 3 ya fuerza UTF-8, pero esto deja compatibilidad con eventos viejos.
-    """
     if value is None:
         return ""
 
@@ -212,7 +231,6 @@ def repair_mojibake(value: Optional[str]) -> str:
 
 
 def compact_text(value: Optional[str], max_len: int = 450) -> str:
-    """Normaliza saltos de línea/espacios y limita longitud para Telegram."""
     text = repair_mojibake(value)
     if not text:
         return "Sin detalle técnico adicional."
@@ -224,7 +242,6 @@ def compact_text(value: Optional[str], max_len: int = 450) -> str:
 
 
 def extract_event_id(value: Any) -> Optional[str]:
-    """Extrae un Event ID conocido desde int/string/dict/modelo Pydantic."""
     if value is None:
         return None
 
@@ -362,10 +379,6 @@ def _parse_1102(raw_message: str) -> Dict[str, Optional[str]]:
 
 
 def _extract_labeled_value(text: str, labels: List[str]) -> Optional[str]:
-    """
-    Extractor genérico para mensajes de Defender.
-    Se mantiene conservador para evitar inventar datos cuando el evento viene con formato variable.
-    """
     normalized = compact_text(text, max_len=5000)
     label_pattern = "|".join(re.escape(label) for label in labels)
     stop_labels = [
@@ -388,13 +401,12 @@ def _extract_labeled_value(text: str, labels: List[str]) -> Optional[str]:
 
 
 def _build_4625_protocol(base_key: str, parsed: Dict[str, Optional[str]]) -> Dict[str, Any]:
-    if base_key == "4625_BURST":
-        return RESPONSE_PROTOCOLS["4625_BURST"]
+    if base_key in {"4625_BURST", "4625_BURST_HIGH"}:
+        return RESPONSE_PROTOCOLS[base_key]
 
     logon_type = parsed.get("logon_type")
     source_ip = parsed.get("source_ip")
 
-    # Si hay origen de red no local, o Logon Type 10/3, lo subimos a ALTA.
     if (source_ip and not _is_local_source_ip(source_ip)) or logon_type in {"3", "10"}:
         return RESPONSE_PROTOCOLS["4625_NETWORK"]
 
@@ -424,31 +436,79 @@ def get_protocol_by_id(event_id: Optional[Any]) -> Dict[str, Any]:
 
 
 def get_protocol(event_message: str) -> Dict[str, Any]:
-    """Compatibilidad con el backend anterior."""
     return get_protocol_by_id(event_message)
+
+
+def _format_count_line(entry: Any) -> Optional[str]:
+    count = _entry_get(entry, "failed_login_count")
+    if not count:
+        return None
+
+    window_seconds = _entry_get(entry, "window_seconds")
+    if window_seconds:
+        minutes = round(float(window_seconds) / 60, 1)
+        if minutes.is_integer():
+            minutes_text = f"{int(minutes)} minuto(s)"
+        else:
+            minutes_text = f"{minutes} minuto(s)"
+        return f"Intentos detectados: {count} en {minutes_text}"
+
+    return f"Intentos detectados: {count}"
 
 
 def _build_technical_summary(event_id: Optional[str], entry: Any, raw_message: str, protocol: Dict[str, Any]) -> List[str]:
     source = _entry_get(entry, "source") or _entry_get(entry, "log_name") or "Windows Event Log"
     record_id = _entry_get(entry, "record_id")
+    protocol_key = _entry_get(entry, "protocol_key")
 
     lines: List[str] = [protocol["technical_detail"]]
 
-    if record_id:
+    count_line = _format_count_line(entry)
+    if count_line:
+        lines.append(count_line)
+
+    if _entry_get(entry, "first_event_time"):
+        lines.append(f"Primer evento: {_entry_get(entry, 'first_event_time')}")
+    if _entry_get(entry, "last_event_time"):
+        lines.append(f"Último evento: {_entry_get(entry, 'last_event_time')}")
+
+    if record_id and not protocol_key:
         lines.append(f"Record ID: {record_id}")
 
     if event_id == "4625":
+        if protocol_key in {"4625_BURST", "4625_BURST_HIGH"}:
+            logon_type = _entry_get(entry, "logon_type")
+            target_user = _entry_get(entry, "target_user")
+            source_ip = _entry_get(entry, "source_ip")
+            record_ids = _entry_get(entry, "record_ids")
+
+            if logon_type:
+                lines.append(f"Tipo de inicio de sesión: {logon_type} ({_logon_type_description(str(logon_type))})")
+            if target_user:
+                lines.append(f"Cuenta objetivo: {target_user}")
+            if source_ip:
+                lines.append(f"Origen/IP: {source_ip}")
+            if isinstance(record_ids, list) and record_ids:
+                sample = ", ".join(str(x) for x in record_ids[:8])
+                if len(record_ids) > 8:
+                    sample += ", ..."
+                lines.append(f"Record IDs: {sample}")
+
+            return lines
+
         parsed = _parse_4625(raw_message)
 
         logon_type = parsed.get("logon_type")
         if logon_type:
             lines.append(f"Tipo de inicio de sesión: {logon_type} ({_logon_type_description(logon_type)})")
 
-        if parsed.get("target_user"):
-            lines.append(f"Cuenta objetivo: {parsed['target_user']}")
+        target = parsed.get("target_user") or _entry_get(entry, "target_user")
+        if target:
+            lines.append(f"Cuenta objetivo: {target if target != '-' else 'no informada'}")
 
-        if parsed.get("source_ip"):
-            lines.append(f"Origen/IP: {parsed['source_ip']}")
+        source_ip = parsed.get("source_ip") or _entry_get(entry, "source_ip")
+        if source_ip:
+            lines.append(f"Origen/IP: {source_ip}")
 
         if parsed.get("source_port") and parsed["source_port"] != "0":
             lines.append(f"Puerto origen: {parsed['source_port']}")
@@ -488,7 +548,6 @@ def _build_technical_summary(event_id: Optional[str], entry: Any, raw_message: s
 
         lines.append(f"Origen: {source}")
 
-        # Si no pudimos extraer campos útiles, agregamos un extracto breve, no el texto completo.
         if len(lines) <= (3 if record_id else 2):
             lines.append(f"Extracto: {compact_text(raw_message, max_len=300)}")
 
@@ -499,21 +558,32 @@ def _build_technical_summary(event_id: Optional[str], entry: Any, raw_message: s
     return lines
 
 
+def _custom_what_detected(event_id: Optional[str], entry: Any, protocol: Dict[str, Any]) -> str:
+    protocol_key = _entry_get(entry, "protocol_key")
+    count = _entry_get(entry, "failed_login_count")
+
+    if event_id == "4625" and count and not protocol_key:
+        return (
+            f"Windows registró {count} intento(s) fallido(s) de inicio de sesión. "
+            "El volumen no alcanzó el umbral de fuerza bruta, pero conviene verificar "
+            "si el acceso fue legítimo o esperado."
+        )
+
+    return protocol["what_detected"]
+
+
 def format_alert(entry: Any, client_name: str) -> str:
-    """
-    Construye una alerta profesional para Telegram.
-    Acepta dict, Pydantic model o cualquier objeto con atributos equivalentes.
-    """
     raw_message = repair_mojibake(_entry_get(entry, "raw_message") or _entry_get(entry, "message") or "")
     event_id = extract_event_id(_entry_get(entry, "event_id") or _entry_get(entry, "message") or raw_message)
     protocol = _select_protocol(event_id, entry, raw_message)
 
     hostname = _entry_get(entry, "hostname") or "No informado"
-    event_time = _entry_get(entry, "event_time") or _entry_get(entry, "timestamp") or "No informado"
+    event_time = _entry_get(entry, "event_time") or _entry_get(entry, "last_event_time") or _entry_get(entry, "timestamp") or "No informado"
 
     steps = "\n".join(f"{idx}. {step}" for idx, step in enumerate(protocol["action_steps"], start=1))
     detail_lines = _build_technical_summary(event_id, entry, raw_message, protocol)
     technical_block = "\n".join(detail_lines)
+    what_detected = _custom_what_detected(event_id, entry, protocol)
 
     return (
         f"{protocol['title']}\n\n"
@@ -522,7 +592,7 @@ def format_alert(entry: Any, client_name: str) -> str:
         f"🕒 Hora del evento: {event_time}\n"
         f"⚡ Prioridad: {protocol['urgency']}\n\n"
         f"📌 Qué detectó LSC:\n"
-        f"{protocol['what_detected']}\n\n"
+        f"{what_detected}\n\n"
         f"🛠️ Acción recomendada:\n"
         f"{steps}\n\n"
         f"🔎 Detalle técnico:\n"

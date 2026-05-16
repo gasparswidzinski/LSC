@@ -60,7 +60,7 @@ class LogEvent(Base):
 
 Base.metadata.create_all(bind=engine)
 
-app = FastAPI(title="Log-Sentinel Cloud API", version="0.9.1-pilot")
+app = FastAPI(title="Log-Sentinel Cloud API", version="0.9.2-pilot")
 
 
 class LogEntry(BaseModel):
@@ -77,6 +77,20 @@ class LogEntry(BaseModel):
     agent_version: Optional[str] = None
     record_id: Optional[int] = None
     log_name: Optional[str] = None
+
+    # Sprint 4: campos de agregación inteligente para Event ID 4625
+    protocol_key: Optional[str] = None
+    failed_login_count: Optional[int] = None
+    window_seconds: Optional[int] = None
+    first_event_time: Optional[str] = None
+    last_event_time: Optional[str] = None
+    source_ip: Optional[str] = None
+    target_user: Optional[str] = None
+    logon_type: Optional[str] = None
+    record_ids: Optional[List[int]] = None
+
+    class Config:
+        extra = "allow"
 
 
 def model_to_dict(entry: LogEntry) -> Dict[str, Any]:
