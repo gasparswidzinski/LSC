@@ -3,7 +3,7 @@ from pydantic import BaseModel
 from typing import Any, Dict, List, Optional
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import requests
 from fastapi import Request
@@ -11,7 +11,7 @@ from sqlalchemy import Boolean, Column, DateTime, Integer, String, create_engine
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import Session, sessionmaker
 
-from protocols import extract_event_id, format_alert
+from protocols import extract_event_id, format_alert, format_agent_offline_alert, format_agent_online_alert
 
 
 # --- CONFIGURACIÓN GENERAL ---
@@ -19,6 +19,11 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 MP_ACCESS_TOKEN = os.getenv("MP_ACCESS_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
+
+# Sprint 9 — Monitoreo de agente offline
+OFFLINE_THRESHOLD_MINUTES = int(os.getenv("OFFLINE_THRESHOLD_MINUTES", "60"))
+OFFLINE_REPEAT_HOURS = int(os.getenv("OFFLINE_REPEAT_HOURS", "6"))
+OFFLINE_CHECK_SECRET = os.getenv("OFFLINE_CHECK_SECRET")
 
 if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
@@ -58,9 +63,27 @@ class LogEvent(Base):
     timestamp = Column(DateTime, default=datetime.utcnow)
 
 
+class AgentMonitorState(Base):
+    """
+    Sprint 9:
+    Estado mínimo para evitar spam de alertas offline y poder avisar recuperación.
+    No modifica la tabla clients.
+    """
+
+    __tablename__ = "agent_monitor_state"
+
+    id = Column(Integer, primary_key=True, index=True)
+    client_id = Column(Integer, unique=True, index=True)
+    is_offline = Column(Boolean, default=False)
+    offline_since = Column(DateTime, nullable=True)
+    last_offline_alert_at = Column(DateTime, nullable=True)
+    last_online_alert_at = Column(DateTime, nullable=True)
+    updated_at = Column(DateTime, default=datetime.utcnow)
+
+
 Base.metadata.create_all(bind=engine)
 
-app = FastAPI(title="Log-Sentinel Cloud API", version="0.9.4-pilot")
+app = FastAPI(title="Log-Sentinel Cloud API", version="0.9.5-pilot")
 
 
 class LogEntry(BaseModel):
@@ -143,6 +166,34 @@ async def send_telegram_msg(chat_id: str, text: str):
         print(f"[ERROR] Falló el envío a Telegram: {e}")
 
 
+def _event_log(db: Session, tenant_id: str, event_type: str, data: Dict[str, Any]):
+    """Guarda eventos operativos internos en la tabla events sin migrar esquema."""
+    payload = {"type": event_type, **data}
+    db.add(
+        LogEvent(
+            tenant_id=tenant_id,
+            message=json.dumps(payload, ensure_ascii=False, default=str),
+            timestamp=datetime.utcnow(),
+        )
+    )
+
+
+def _get_or_create_monitor_state(db: Session, client_id: int) -> AgentMonitorState:
+    state = db.query(AgentMonitorState).filter(AgentMonitorState.client_id == client_id).first()
+    if not state:
+        state = AgentMonitorState(client_id=client_id, is_offline=False, updated_at=datetime.utcnow())
+        db.add(state)
+        db.flush()
+    return state
+
+
+def _admin_secret_valid(x_admin_secret: Optional[str]) -> bool:
+    if not OFFLINE_CHECK_SECRET:
+        # En producción conviene configurarlo. Para MVP permite prueba manual sin bloquear.
+        return True
+    return x_admin_secret == OFFLINE_CHECK_SECRET
+
+
 @app.get("/setup-demo")
 def setup_demo(db: Session = Depends(get_db)):
     client = db.query(Client).filter(Client.api_key == "lsc_demo_12345").first()
@@ -155,8 +206,36 @@ def setup_demo(db: Session = Depends(get_db)):
 
 
 @app.post("/v1/heartbeat")
-def heartbeat(client: Client = Depends(verify_api_key), db: Session = Depends(get_db)):
-    client.last_seen = datetime.utcnow()
+def heartbeat(
+    background_tasks: BackgroundTasks,
+    client: Client = Depends(verify_api_key),
+    db: Session = Depends(get_db),
+):
+    now = datetime.utcnow()
+    client.last_seen = now
+
+    state = _get_or_create_monitor_state(db, client.id)
+    was_offline = bool(state.is_offline)
+
+    if was_offline:
+        state.is_offline = False
+        state.last_online_alert_at = now
+        state.updated_at = now
+
+        destino_id = client.telegram_chat_id or os.getenv("TELEGRAM_CHAT_ID")
+        if destino_id:
+            msg = format_agent_online_alert(client.name, now, now)
+            background_tasks.add_task(send_telegram_msg, destino_id, msg)
+
+        _event_log(
+            db,
+            client.name,
+            "agent_online",
+            {"client_id": client.id, "last_seen": now.isoformat()},
+        )
+    else:
+        state.updated_at = now
+
     db.commit()
     return {"status": "alive", "tenant": client.name, "last_seen": client.last_seen.isoformat()}
 
@@ -202,6 +281,99 @@ async def ingest_logs(
         raise HTTPException(status_code=500, detail="Error interno al procesar eventos")
 
     return {"status": "saved", "tenant": client.name, "received": received, "alerted": alerted}
+
+
+@app.post("/admin/check-offline-agents")
+def check_offline_agents(
+    background_tasks: BackgroundTasks,
+    x_admin_secret: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+):
+    """
+    Sprint 9:
+    Revisa clientes activos y avisa si no reportan heartbeat dentro del umbral.
+
+    Recomendación:
+    - Ejecutar manualmente para pruebas.
+    - Luego programar un cron externo cada 10/15 minutos.
+    - Proteger con OFFLINE_CHECK_SECRET en Railway.
+    """
+    if not _admin_secret_valid(x_admin_secret):
+        raise HTTPException(status_code=403, detail="Admin secret inválido")
+
+    now = datetime.utcnow()
+    threshold_delta = timedelta(minutes=OFFLINE_THRESHOLD_MINUTES)
+    repeat_delta = timedelta(hours=OFFLINE_REPEAT_HOURS)
+
+    checked = 0
+    offline_detected = 0
+    alerts_sent = 0
+    skipped_without_last_seen = 0
+
+    active_clients = db.query(Client).filter(Client.is_active == True).all()  # noqa: E712
+
+    for client in active_clients:
+        checked += 1
+
+        if not client.last_seen:
+            skipped_without_last_seen += 1
+            continue
+
+        age = now - client.last_seen
+        if age <= threshold_delta:
+            continue
+
+        offline_detected += 1
+        state = _get_or_create_monitor_state(db, client.id)
+
+        should_alert = False
+        if not state.is_offline:
+            should_alert = True
+            state.offline_since = client.last_seen
+        elif not state.last_offline_alert_at:
+            should_alert = True
+        elif now - state.last_offline_alert_at >= repeat_delta:
+            should_alert = True
+
+        state.is_offline = True
+        state.updated_at = now
+
+        if should_alert:
+            state.last_offline_alert_at = now
+            destino_id = client.telegram_chat_id or os.getenv("TELEGRAM_CHAT_ID")
+            if destino_id:
+                msg = format_agent_offline_alert(
+                    client.name,
+                    client.last_seen,
+                    OFFLINE_THRESHOLD_MINUTES,
+                    now,
+                )
+                background_tasks.add_task(send_telegram_msg, destino_id, msg)
+                alerts_sent += 1
+
+            _event_log(
+                db,
+                client.name,
+                "agent_offline",
+                {
+                    "client_id": client.id,
+                    "last_seen": client.last_seen.isoformat(),
+                    "threshold_minutes": OFFLINE_THRESHOLD_MINUTES,
+                    "age_seconds": int(age.total_seconds()),
+                },
+            )
+
+    db.commit()
+
+    return {
+        "status": "ok",
+        "checked": checked,
+        "offline_detected": offline_detected,
+        "alerts_sent": alerts_sent,
+        "threshold_minutes": OFFLINE_THRESHOLD_MINUTES,
+        "repeat_hours": OFFLINE_REPEAT_HOURS,
+        "skipped_without_last_seen": skipped_without_last_seen,
+    }
 
 
 @app.post("/v1/webhooks/mercadopago")

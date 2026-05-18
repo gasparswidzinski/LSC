@@ -779,3 +779,77 @@ def format_alert(entry: Any, client_name: str) -> str:
         f"ℹ️ Nota:\n"
         f"{protocol['note']}"
     )
+
+# --- Sprint 9: alertas de estado del agente ---
+
+def _format_dt_for_alert(value: Any) -> str:
+    if not value:
+        return "No informado"
+    try:
+        if isinstance(value, datetime):
+            return value.isoformat(timespec="seconds")
+        return str(value)
+    except Exception:
+        return str(value)
+
+
+def format_agent_offline_alert(
+    client_name: str,
+    last_seen: Any,
+    threshold_minutes: int,
+    now_value: Any = None,
+) -> str:
+    now_text = _format_dt_for_alert(now_value or datetime.utcnow())
+    last_seen_text = _format_dt_for_alert(last_seen)
+
+    return (
+        "🟨 LSC | AVISO: AGENTE SIN COMUNICACIÓN RECIENTE\n\n"
+        f"🏢 Empresa: {client_name}\n"
+        "🖥️ Equipo: No informado\n"
+        f"🕒 Hora de verificación: {now_text}\n"
+        "⚡ Prioridad: MEDIA\n\n"
+        "📌 Qué detectó LSC:\n"
+        f"LSC no recibió comunicación reciente del agente durante al menos {threshold_minutes} minuto(s). "
+        "Esto puede deberse a que el servidor está apagado, sin conexión a Internet, reiniciándose, "
+        "con el agente detenido, desinstalado o con conectividad temporalmente interrumpida.\n\n"
+        "🛠️ Acción recomendada:\n"
+        "1. Verifique si el servidor está encendido y conectado a Internet.\n"
+        "2. Si el servidor debería estar operativo, contacte a su técnico de confianza.\n"
+        "3. Revise si el proceso agent.exe está en ejecución.\n"
+        "4. Revise si la tarea programada LSC_Agent existe y está habilitada.\n\n"
+        "🔎 Detalle técnico:\n"
+        f"Última comunicación registrada: {last_seen_text}\n"
+        f"Umbral configurado: {threshold_minutes} minuto(s) sin comunicación.\n\n"
+        "ℹ️ Nota:\n"
+        "LSC no realizó cambios sobre el servidor. Este aviso solo informa que no se recibió comunicación "
+        "reciente del agente de monitoreo."
+    )
+
+
+def format_agent_online_alert(
+    client_name: str,
+    last_seen: Any,
+    now_value: Any = None,
+) -> str:
+    now_text = _format_dt_for_alert(now_value or datetime.utcnow())
+    last_seen_text = _format_dt_for_alert(last_seen)
+
+    return (
+        "🟩 LSC | AVISO: AGENTE NUEVAMENTE EN LÍNEA\n\n"
+        f"🏢 Empresa: {client_name}\n"
+        "🖥️ Equipo: No informado\n"
+        f"🕒 Hora de verificación: {now_text}\n"
+        "⚡ Prioridad: INFORMATIVA\n\n"
+        "📌 Qué detectó LSC:\n"
+        "LSC volvió a recibir comunicación del agente instalado para este cliente. "
+        "El monitoreo se encuentra operativo nuevamente desde la última comunicación recibida.\n\n"
+        "🛠️ Acción recomendada:\n"
+        "1. No se requiere acción inmediata si la recuperación fue esperada.\n"
+        "2. Si el servidor estuvo sin comunicación durante un período prolongado, revise con su técnico de confianza "
+        "si hubo apagado, reinicio, falta de Internet o mantenimiento.\n\n"
+        "🔎 Detalle técnico:\n"
+        f"Última comunicación registrada: {last_seen_text}\n\n"
+        "ℹ️ Nota:\n"
+        "LSC solo notificó la recuperación de comunicación del agente. No modificó la configuración del servidor."
+    )
+
