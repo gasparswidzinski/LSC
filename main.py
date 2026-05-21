@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 
 import requests
 from fastapi import Request
-from sqlalchemy import Boolean, Column, DateTime, Integer, String, create_engine
+from sqlalchemy import Boolean, Column, DateTime, Integer, String, Text, create_engine
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -81,9 +81,34 @@ class AgentMonitorState(Base):
     updated_at = Column(DateTime, default=datetime.utcnow)
 
 
+class TermsAcceptance(Base):
+    """
+    Constancia remota de aceptación de términos del instalador LSC.
+    Se registra cuando el usuario ingresa S en instalar_lsc_v4.bat.
+    No reemplaza el contrato principal; sirve como trazabilidad operativa y respaldo contractual.
+    """
+
+    __tablename__ = "terms_acceptances"
+
+    id = Column(Integer, primary_key=True, index=True)
+    client_id = Column(Integer, index=True, nullable=False)
+    client_name = Column(String, nullable=False)
+    terms_version = Column(String, nullable=False)
+    installer_version = Column(String, nullable=True)
+    computer_name = Column(String, nullable=True)
+    windows_user = Column(String, nullable=True)
+    accepted_value = Column(String, nullable=False, default="S")
+    accepted_at_local = Column(String, nullable=True)
+    accepted_at_utc = Column(DateTime, default=datetime.utcnow)
+    source_ip = Column(String, nullable=True)
+    user_agent = Column(String, nullable=True)
+    raw_payload = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
 Base.metadata.create_all(bind=engine)
 
-app = FastAPI(title="Log-Sentinel Cloud API", version="0.9.5-pilot")
+app = FastAPI(title="Log-Sentinel Cloud API", version="0.9.6-pilot-terms")
 
 
 class LogEntry(BaseModel):
@@ -111,6 +136,19 @@ class LogEntry(BaseModel):
     target_user: Optional[str] = None
     logon_type: Optional[str] = None
     record_ids: Optional[List[int]] = None
+
+    class Config:
+        extra = "allow"
+
+
+class TermsAcceptancePayload(BaseModel):
+    terms_version: str
+    installer_version: Optional[str] = None
+    computer_name: Optional[str] = None
+    windows_user: Optional[str] = None
+    accepted_value: str = "S"
+    accepted_at_local: Optional[str] = None
+    local_terms_file: Optional[str] = None
 
     class Config:
         extra = "allow"
@@ -238,6 +276,74 @@ def heartbeat(
 
     db.commit()
     return {"status": "alive", "tenant": client.name, "last_seen": client.last_seen.isoformat()}
+
+
+@app.post("/v1/terms-acceptance")
+async def register_terms_acceptance(
+    payload: TermsAcceptancePayload,
+    request: Request,
+    client: Client = Depends(verify_api_key),
+    db: Session = Depends(get_db),
+):
+    """
+    Registra en el backend la aceptación remota de términos del instalador.
+
+    El instalador debe enviar este endpoint de forma no bloqueante luego de que
+    el usuario ingrese S. La constancia local sigue siendo el respaldo primario
+    cuando no haya conectividad.
+    """
+    data = payload.dict(exclude_none=True)
+    accepted_value = (payload.accepted_value or "").strip().upper()
+
+    if accepted_value != "S":
+        raise HTTPException(status_code=400, detail="Aceptación inválida")
+
+    source_ip = request.client.host if request.client else None
+    user_agent = request.headers.get("user-agent")
+
+    acceptance = TermsAcceptance(
+        client_id=client.id,
+        client_name=client.name,
+        terms_version=payload.terms_version,
+        installer_version=payload.installer_version,
+        computer_name=payload.computer_name,
+        windows_user=payload.windows_user,
+        accepted_value=accepted_value,
+        accepted_at_local=payload.accepted_at_local,
+        accepted_at_utc=datetime.utcnow(),
+        source_ip=source_ip,
+        user_agent=user_agent,
+        raw_payload=json.dumps(data, ensure_ascii=False, default=str),
+        created_at=datetime.utcnow(),
+    )
+
+    try:
+        db.add(acceptance)
+        _event_log(
+            db,
+            client.name,
+            "terms_acceptance",
+            {
+                "client_id": client.id,
+                "terms_version": payload.terms_version,
+                "installer_version": payload.installer_version,
+                "computer_name": payload.computer_name,
+                "accepted_value": accepted_value,
+                "source_ip": source_ip,
+            },
+        )
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        print(f"[ERROR] No se pudo registrar aceptación de términos: {e}")
+        raise HTTPException(status_code=500, detail="Error interno al registrar aceptación")
+
+    return {
+        "status": "ok",
+        "tenant": client.name,
+        "terms_version": payload.terms_version,
+        "accepted_at_utc": acceptance.accepted_at_utc.isoformat(),
+    }
 
 
 @app.post("/v1/ingest")
@@ -421,3 +527,4 @@ async def mercadopago_webhook(request: Request, db: Session = Depends(get_db)):
                         db.commit()
 
     return {"status": "ok"}
+
