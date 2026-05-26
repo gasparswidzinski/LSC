@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 
 import requests
 from fastapi import Request
-from sqlalchemy import Boolean, Column, DateTime, Integer, String, Text, create_engine
+from sqlalchemy import Boolean, Column, DateTime, Integer, Numeric, String, Text, create_engine
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -47,6 +47,34 @@ class Client(Base):
     last_seen = Column(DateTime, default=datetime.utcnow)
     telegram_chat_id = Column(String, nullable=True)
     is_active = Column(Boolean, default=True)
+
+    # Campos comerciales/operativos agregados por migracion_pagos_lsc_v1.sql.
+    # IMPORTANTE: ejecutar la migración antes de desplegar este main.py.
+    status = Column(String, nullable=True, default="active")
+    plan = Column(String, nullable=True)
+    business_type = Column(String, nullable=True)
+    email = Column(String, nullable=True)
+    phone = Column(String, nullable=True)
+    responsible_name = Column(String, nullable=True)
+    technician_name = Column(String, nullable=True)
+    technician_contact = Column(String, nullable=True)
+    server_count = Column(Integer, nullable=True, default=1)
+    notes = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow)
+
+    payment_status = Column(String, nullable=True, default="pending_payment")
+    subscription_status = Column(String, nullable=True, default="pending")
+    mp_plan_id = Column(String, nullable=True)
+    mp_preapproval_id = Column(String, nullable=True)
+    mp_last_payment_id = Column(String, nullable=True)
+    mp_payer_email = Column(String, nullable=True)
+    last_payment_at = Column(DateTime, nullable=True)
+    last_payment_status = Column(String, nullable=True)
+    paid_until = Column(DateTime, nullable=True)
+    payment_amount = Column(Numeric(12, 2), nullable=True)
+    payment_currency = Column(String, nullable=True)
+    payment_notes = Column(Text, nullable=True)
 
 
 class LogEvent(Base):
@@ -106,9 +134,35 @@ class TermsAcceptance(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
+class PaymentWebhookEvent(Base):
+    """
+    Auditoría de webhooks de Mercado Pago.
+    Guarda evento crudo, respuesta consultada a MP y resultado del procesamiento.
+    """
+
+    __tablename__ = "payment_webhook_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    event_type = Column(String, nullable=True)
+    action = Column(String, nullable=True)
+    mp_resource_id = Column(String, index=True, nullable=True)
+    client_id = Column(Integer, index=True, nullable=True)
+    client_name = Column(String, nullable=True)
+    external_reference = Column(String, index=True, nullable=True)
+    payment_status = Column(String, nullable=True)
+    processed_ok = Column(Boolean, default=False)
+    error_message = Column(Text, nullable=True)
+    raw_payload = Column(Text, nullable=True)
+    mp_response = Column(Text, nullable=True)
+    source_ip = Column(String, nullable=True)
+    user_agent = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    processed_at = Column(DateTime, nullable=True)
+
+
 Base.metadata.create_all(bind=engine)
 
-app = FastAPI(title="Log-Sentinel Cloud API", version="0.9.6-pilot-terms")
+app = FastAPI(title="Log-Sentinel Cloud API", version="0.9.7-pilot-payments-trace")
 
 
 class LogEntry(BaseModel):
@@ -482,49 +536,256 @@ def check_offline_agents(
     }
 
 
+def _json_dumps(data: Any) -> str:
+    return json.dumps(data, ensure_ascii=False, default=str)
+
+
+def _get_request_ip(request: Request) -> Optional[str]:
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    real_ip = request.headers.get("x-real-ip")
+    if real_ip:
+        return real_ip.strip()
+    return request.client.host if request.client else None
+
+
+def _parse_mp_datetime(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        # Mercado Pago suele devolver ISO con zona horaria. PostgreSQL/SQLAlchemy actual guarda naive UTC.
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is not None:
+            return parsed.astimezone().replace(tzinfo=None)
+        return parsed
+    except Exception:
+        return None
+
+
+def _extract_mp_preapproval_id(payment_data: Dict[str, Any]) -> Optional[str]:
+    # La forma exacta puede variar según el tipo de pago/suscripción.
+    candidates = [
+        payment_data.get("preapproval_id"),
+        payment_data.get("subscription_id"),
+        payment_data.get("preapproval_plan_id"),
+    ]
+    metadata = payment_data.get("metadata") or {}
+    if isinstance(metadata, dict):
+        candidates.extend([
+            metadata.get("preapproval_id"),
+            metadata.get("subscription_id"),
+            metadata.get("preapproval_plan_id"),
+        ])
+    for value in candidates:
+        if value:
+            return str(value)
+    return None
+
+
+def _apply_payment_status_to_client(client: Client, payment_id: str, payment_data: Dict[str, Any]) -> None:
+    status = str(payment_data.get("status") or "unknown")
+    now = datetime.utcnow()
+
+    if status == "approved":
+        client.is_active = True
+        client.status = "active"
+        client.payment_status = "approved"
+        client.subscription_status = "active"
+    elif status in {"pending", "in_process", "authorized"}:
+        client.is_active = False
+        client.status = "pending_payment"
+        client.payment_status = status
+        client.subscription_status = "pending"
+    elif status == "rejected":
+        client.is_active = False
+        client.status = "past_due"
+        client.payment_status = "rejected"
+        client.subscription_status = "past_due"
+    elif status in {"cancelled", "refunded", "charged_back"}:
+        client.is_active = False
+        client.status = status
+        client.payment_status = status
+        client.subscription_status = "inactive" if status in {"refunded", "charged_back"} else "cancelled"
+    else:
+        # Estado no contemplado: por prudencia no se activa el servicio automáticamente.
+        client.is_active = False
+        client.status = "inactive"
+        client.payment_status = status
+        client.subscription_status = "inactive"
+
+    client.mp_last_payment_id = str(payment_id)
+    client.last_payment_status = status
+    client.last_payment_at = (
+        _parse_mp_datetime(payment_data.get("date_approved"))
+        or _parse_mp_datetime(payment_data.get("money_release_date"))
+        or _parse_mp_datetime(payment_data.get("date_created"))
+        or now
+    )
+
+    preapproval_id = _extract_mp_preapproval_id(payment_data)
+    if preapproval_id:
+        client.mp_preapproval_id = preapproval_id
+
+    payer = payment_data.get("payer") or {}
+    if isinstance(payer, dict) and payer.get("email"):
+        client.mp_payer_email = payer.get("email")
+
+    if payment_data.get("transaction_amount") is not None:
+        client.payment_amount = payment_data.get("transaction_amount")
+    if payment_data.get("currency_id"):
+        client.payment_currency = payment_data.get("currency_id")
+
+    client.payment_notes = f"Último evento Mercado Pago: payment_id={payment_id}, status={status}, actualizado={now.isoformat()} UTC"
+    client.updated_at = now
+
+
 @app.post("/v1/webhooks/mercadopago")
 async def mercadopago_webhook(request: Request, db: Session = Depends(get_db)):
     """
-    Recibe notificaciones de Mercado Pago y confirma el estado consultando la API de MP.
-    Nota: este MVP conserva is_active para no romper el esquema actual. La mejora siguiente
-    debería incorporar status/payment_status/subscription_id con migración formal.
+    Recibe webhooks de Mercado Pago, guarda auditoría y actualiza estado operativo.
+
+    Regla operativa LSC:
+    - payment.status == approved  => client.is_active = True
+    - rejected/cancelled/refunded/charged_back => client.is_active = False
+    - pending/in_process/authorized => client.is_active = False hasta aprobación real
     """
+    source_ip = _get_request_ip(request)
+    user_agent = request.headers.get("user-agent")
+
     try:
         payload = await request.json()
-    except Exception:
+    except Exception as exc:
+        db.add(PaymentWebhookEvent(
+            event_type="invalid_json",
+            processed_ok=False,
+            error_message=f"JSON inválido: {exc}",
+            source_ip=source_ip,
+            user_agent=user_agent,
+            created_at=datetime.utcnow(),
+        ))
+        db.commit()
         return {"status": "ok"}
 
     event_type = payload.get("type")
     action = payload.get("action")
+    payment_id = str((payload.get("data") or {}).get("id") or "")
 
-    if event_type == "payment" or action == "payment.created":
-        payment_id = payload.get("data", {}).get("id")
+    audit = PaymentWebhookEvent(
+        event_type=event_type,
+        action=action,
+        mp_resource_id=payment_id or None,
+        raw_payload=_json_dumps(payload),
+        source_ip=source_ip,
+        user_agent=user_agent,
+        created_at=datetime.utcnow(),
+        processed_ok=False,
+    )
+    db.add(audit)
+    db.flush()
 
-        if payment_id and MP_ACCESS_TOKEN:
-            headers = {"Authorization": f"Bearer {MP_ACCESS_TOKEN}"}
-            mp_url = f"https://api.mercadopago.com/v1/payments/{payment_id}"
+    is_payment_event = event_type == "payment" or action in {"payment.created", "payment.updated"}
+    if not is_payment_event:
+        audit.processed_ok = True
+        audit.error_message = "Evento ignorado: no es payment."
+        audit.processed_at = datetime.utcnow()
+        db.commit()
+        return {"status": "ok", "ignored": True}
 
-            try:
-                response = requests.get(mp_url, headers=headers, timeout=15)
-            except Exception as e:
-                print(f"[MercadoPago] No se pudo consultar el pago {payment_id}: {e}")
-                return {"status": "ok"}
+    if not payment_id:
+        audit.error_message = "Webhook payment sin data.id."
+        audit.processed_at = datetime.utcnow()
+        db.commit()
+        return {"status": "ok", "processed": False}
 
-            if response.status_code == 200:
-                payment_data = response.json()
-                status = payment_data.get("status")
-                api_key_cliente = payment_data.get("external_reference")
+    if not MP_ACCESS_TOKEN:
+        audit.error_message = "MP_ACCESS_TOKEN no configurado."
+        audit.processed_at = datetime.utcnow()
+        db.commit()
+        return {"status": "ok", "processed": False}
 
-                if api_key_cliente:
-                    cliente = db.query(Client).filter(Client.api_key == api_key_cliente).first()
-                    if cliente:
-                        if status == "approved":
-                            cliente.is_active = True
-                            print(f"[COBRANZA] Pago aprobado. Cliente activado: {cliente.name}")
-                        elif status in ["rejected", "cancelled", "refunded"]:
-                            cliente.is_active = False
-                            print(f"[COBRANZA] Pago fallido/cancelado. Cliente desactivado: {cliente.name}")
-                        db.commit()
+    headers = {"Authorization": f"Bearer {MP_ACCESS_TOKEN}"}
+    mp_url = f"https://api.mercadopago.com/v1/payments/{payment_id}"
+
+    try:
+        response = requests.get(mp_url, headers=headers, timeout=15)
+    except Exception as exc:
+        audit.error_message = f"No se pudo consultar pago MP {payment_id}: {exc}"
+        audit.processed_at = datetime.utcnow()
+        db.commit()
+        print(f"[MercadoPago] {audit.error_message}")
+        return {"status": "ok", "processed": False}
+
+    audit.mp_response = response.text[:20000]
+
+    if response.status_code != 200:
+        audit.error_message = f"Mercado Pago respondió {response.status_code}."
+        audit.processed_at = datetime.utcnow()
+        db.commit()
+        print(f"[MercadoPago] {audit.error_message} body={response.text[:500]}")
+        return {"status": "ok", "processed": False}
+
+    payment_data = response.json()
+    payment_status = str(payment_data.get("status") or "unknown")
+    external_reference = payment_data.get("external_reference")
+
+    audit.payment_status = payment_status
+    audit.external_reference = external_reference
+
+    if not external_reference:
+        audit.error_message = "Pago sin external_reference; no se puede vincular a cliente LSC."
+        audit.processed_at = datetime.utcnow()
+        db.commit()
+        return {"status": "ok", "processed": False}
+
+    cliente = db.query(Client).filter(Client.api_key == external_reference).first()
+    if not cliente:
+        audit.error_message = "No existe cliente con API Key/external_reference informado por MP."
+        audit.processed_at = datetime.utcnow()
+        db.commit()
+        return {"status": "ok", "processed": False}
+
+    try:
+        _apply_payment_status_to_client(cliente, payment_id, payment_data)
+        audit.client_id = cliente.id
+        audit.client_name = cliente.name
+        audit.processed_ok = True
+        audit.processed_at = datetime.utcnow()
+
+        _event_log(
+            db,
+            cliente.name,
+            "mercadopago_payment",
+            {
+                "client_id": cliente.id,
+                "payment_id": payment_id,
+                "payment_status": payment_status,
+                "is_active": cliente.is_active,
+                "external_reference": external_reference,
+            },
+        )
+        db.commit()
+        print(f"[COBRANZA] Cliente={cliente.name} payment_id={payment_id} status={payment_status} is_active={cliente.is_active}")
+    except Exception as exc:
+        db.rollback()
+        print(f"[ERROR] Falló procesamiento de webhook MP {payment_id}: {exc}")
+        # Intento de registrar el error en una nueva sesión lógica de esta misma request.
+        audit = PaymentWebhookEvent(
+            event_type=event_type,
+            action=action,
+            mp_resource_id=payment_id,
+            external_reference=external_reference,
+            payment_status=payment_status,
+            processed_ok=False,
+            error_message=f"Error interno al actualizar cliente: {exc}",
+            raw_payload=_json_dumps(payload),
+            mp_response=response.text[:20000],
+            source_ip=source_ip,
+            user_agent=user_agent,
+            created_at=datetime.utcnow(),
+            processed_at=datetime.utcnow(),
+        )
+        db.add(audit)
+        db.commit()
 
     return {"status": "ok"}
-
