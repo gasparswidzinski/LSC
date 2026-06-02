@@ -13,6 +13,8 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from protocols import extract_event_id, format_alert, format_agent_offline_alert, format_agent_online_alert
 
+from routers import cafe
+
 
 # --- CONFIGURACIÓN GENERAL ---
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -163,6 +165,12 @@ class PaymentWebhookEvent(Base):
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="Log-Sentinel Cloud API", version="0.9.7-pilot-payments-trace")
+
+app.include_router(
+    cafe.router,
+    prefix="/api/cafe",
+    tags=["LSC_Cafe"],
+)
 
 
 class LogEntry(BaseModel):
