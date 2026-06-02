@@ -81,6 +81,49 @@ class CafeDevice(Base):
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow)
 
+class CafeAlert(Base):
+    """
+    Alerta registrada por LSC_Cafe.
+
+    Tabla aislada del LSC original.
+    No modifica events ni el flujo /v1/ingest.
+    """
+
+    __tablename__ = "cafe_alerts"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    # Identidad comercial / operativa
+    client_name = Column(String, index=True, nullable=False)
+    branch_name = Column(String, index=True, nullable=False)
+    branch_id = Column(String, index=True, nullable=False)
+
+    # Identidad del equipo
+    device_id = Column(String, index=True, nullable=False)
+    device_alias = Column(String, nullable=False)
+    device_role = Column(String, nullable=False)
+    hostname = Column(String, index=True, nullable=False)
+
+    # Datos operativos
+    api_key = Column(String, index=True, nullable=False)
+    technician_name = Column(String, nullable=True)
+    telegram_group_name = Column(String, nullable=True)
+    agent_version = Column(String, nullable=True)
+
+    # Alerta
+    severity = Column(String, index=True, nullable=False)
+    event_type = Column(String, index=True, nullable=False)
+    event_title = Column(String, nullable=False)
+    event_description = Column(Text, nullable=True)
+    suggested_action = Column(Text, nullable=True)
+    detected_at_utc = Column(String, nullable=True)
+
+    # Estado interno
+    status = Column(String, nullable=False, default="received")
+
+    # Auditoría
+    raw_payload = Column(Text, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
 
 Base.metadata.create_all(bind=engine)
 
@@ -106,6 +149,29 @@ class CafeHeartbeatPayload(BaseModel):
     status: str
     timestamp_utc: str
 
+class CafeAlertPayload(BaseModel):
+    product_variant: str = Field(..., examples=["LSC_CAFE"])
+    api_key: str
+
+    client_name: str
+    branch_name: str
+    branch_id: str
+
+    device_id: str
+    device_alias: str
+    device_role: str
+    hostname: str
+
+    technician_name: Optional[str] = None
+    telegram_group_name: Optional[str] = None
+    agent_version: Optional[str] = None
+
+    severity: str
+    event_type: str
+    event_title: str
+    event_description: Optional[str] = None
+    detected_at_utc: str
+    suggested_action: Optional[str] = None
 
 # --- HELPERS ---
 def get_db():
@@ -155,6 +221,30 @@ def _validate_cafe_payload(payload: CafeHeartbeatPayload) -> None:
 
     if not payload.api_key.strip():
         raise HTTPException(status_code=403, detail="api_key es obligatoria.")
+
+def _validate_cafe_alert_payload(payload: CafeAlertPayload) -> None:
+    if payload.product_variant != "LSC_CAFE":
+        raise HTTPException(
+            status_code=400,
+            detail="product_variant inválido. Se esperaba LSC_CAFE.",
+        )
+
+    if not payload.branch_id.strip():
+        raise HTTPException(status_code=400, detail="branch_id es obligatorio.")
+
+    if not payload.device_id.strip():
+        raise HTTPException(status_code=400, detail="device_id es obligatorio.")
+
+    if not payload.api_key.strip():
+        raise HTTPException(status_code=403, detail="api_key es obligatoria.")
+
+    allowed_severities = {"info", "warning", "critical"}
+
+    if payload.severity not in allowed_severities:
+        raise HTTPException(
+            status_code=400,
+            detail="severity inválida. Valores permitidos: info, warning, critical.",
+        )
 
 
 # --- ENDPOINTS ---
@@ -267,4 +357,89 @@ def cafe_heartbeat(
         "status": payload.status,
         "api_key_masked": _mask_api_key(payload.api_key),
         "last_seen_at_utc": device.last_seen_at.isoformat() + "Z",
+    }
+
+@router.post("/alert")
+def cafe_alert(
+    payload: CafeAlertPayload,
+    db: Session = Depends(get_db),
+):
+    """
+    Alerta LSC_Cafe v0.1.
+
+    Esta versión:
+    - recibe una alerta del agente Cafe;
+    - valida product_variant y severidad;
+    - guarda la alerta en cafe_alerts;
+    - no modifica tablas del LSC original;
+    - no envía Telegram todavía.
+    """
+
+    _validate_cafe_alert_payload(payload)
+
+    now = _utc_now()
+    data = payload_to_dict(payload)
+
+    try:
+        alert = CafeAlert(
+            client_name=payload.client_name,
+            branch_name=payload.branch_name,
+            branch_id=payload.branch_id,
+            device_id=payload.device_id,
+            device_alias=payload.device_alias,
+            device_role=payload.device_role,
+            hostname=payload.hostname,
+            api_key=payload.api_key,
+            technician_name=payload.technician_name,
+            telegram_group_name=payload.telegram_group_name,
+            agent_version=payload.agent_version,
+            severity=payload.severity,
+            event_type=payload.event_type,
+            event_title=payload.event_title,
+            event_description=payload.event_description,
+            suggested_action=payload.suggested_action,
+            detected_at_utc=payload.detected_at_utc,
+            status="received",
+            raw_payload=json.dumps(data, ensure_ascii=False, default=str),
+            created_at=now,
+        )
+
+        db.add(alert)
+        db.commit()
+        db.refresh(alert)
+
+    except Exception as exc:
+        db.rollback()
+        print(f"[LSC_Cafe] Error guardando alerta: {exc}")
+        raise HTTPException(
+            status_code=500,
+            detail="Error interno guardando alerta LSC_Cafe.",
+        )
+
+    print(
+        "[LSC_Cafe] Alerta guardada | "
+        f"cliente={payload.client_name} | "
+        f"sucursal={payload.branch_name} | "
+        f"equipo={payload.device_alias} | "
+        f"severity={payload.severity} | "
+        f"event_type={payload.event_type}"
+    )
+
+    return {
+        "ok": True,
+        "message": "Alerta LSC_Cafe recibida y persistida correctamente.",
+        "alert_id": alert.id,
+        "product_variant": payload.product_variant,
+        "client_name": payload.client_name,
+        "branch_name": payload.branch_name,
+        "branch_id": payload.branch_id,
+        "device_id": payload.device_id,
+        "device_alias": payload.device_alias,
+        "device_role": payload.device_role,
+        "hostname": payload.hostname,
+        "severity": payload.severity,
+        "event_type": payload.event_type,
+        "event_title": payload.event_title,
+        "status": alert.status,
+        "created_at_utc": alert.created_at.isoformat() + "Z",
     }
