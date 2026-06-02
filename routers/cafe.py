@@ -2,6 +2,7 @@ import json
 import os
 from datetime import datetime
 from typing import Any, Dict, Optional
+import requests
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
@@ -246,6 +247,92 @@ def _validate_cafe_alert_payload(payload: CafeAlertPayload) -> None:
             detail="severity inválida. Valores permitidos: info, warning, critical.",
         )
 
+def _get_cafe_telegram_chat_id() -> Optional[str]:
+    """
+    Para piloto:
+    - primero intenta usar un chat específico de LSC_Cafe;
+    - si no existe, usa el TELEGRAM_CHAT_ID general como fallback.
+    """
+    return os.getenv("LSC_CAFE_TELEGRAM_CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID")
+
+
+def _format_cafe_alert_message(payload: CafeAlertPayload) -> str:
+    """
+    Formato prudente para alertas LSC_Cafe.
+    No promete seguridad total.
+    """
+
+    if payload.severity == "critical":
+        header = "🚨 LSC_Cafe - Alerta crítica"
+    elif payload.severity == "warning":
+        header = "⚠️ LSC_Cafe - Advertencia"
+    else:
+        header = "ℹ️ LSC_Cafe - Evento informativo"
+
+    return f"""{header}
+
+Cliente: {payload.client_name}
+Sucursal: {payload.branch_name}
+Equipo: {payload.device_alias}
+Rol: {payload.device_role}
+Host: {payload.hostname}
+
+Evento detectado:
+{payload.event_title}
+
+Detalle:
+{payload.event_description or "Sin detalle adicional."}
+
+Hora:
+{payload.detected_at_utc}
+
+Acción sugerida:
+{payload.suggested_action or "Revisar el equipo o contactar al técnico responsable."}
+
+Técnico responsable:
+{payload.technician_name or "No informado"}
+
+Importante:
+LSC_Cafe realiza monitoreo temprano de eventos críticos. No garantiza seguridad total, no reemplaza antivirus, backup ni soporte técnico.
+"""
+
+
+def _send_cafe_telegram_alert(payload: CafeAlertPayload) -> bool:
+    token = os.getenv("TELEGRAM_TOKEN")
+    chat_id = _get_cafe_telegram_chat_id()
+
+    if not token:
+        print("[LSC_Cafe] TELEGRAM_TOKEN no configurado.")
+        return False
+
+    if not chat_id:
+        print("[LSC_Cafe] LSC_CAFE_TELEGRAM_CHAT_ID/TELEGRAM_CHAT_ID no configurado.")
+        return False
+
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+
+    body = {
+        "chat_id": chat_id,
+        "text": _format_cafe_alert_message(payload)[:3900],
+        "disable_web_page_preview": True,
+    }
+
+    try:
+        response = requests.post(url, json=body, timeout=10)
+
+        if response.ok:
+            print(f"[LSC_Cafe] Telegram enviado correctamente a chat_id={chat_id}")
+            return True
+
+        print(
+            f"[LSC_Cafe] Error Telegram status={response.status_code} "
+            f"body={response.text[:500]}"
+        )
+        return False
+
+    except Exception as exc:
+        print(f"[LSC_Cafe] Excepción enviando Telegram: {exc}")
+        return False
 
 # --- ENDPOINTS ---
 @router.post("/heartbeat")
@@ -371,14 +458,15 @@ def cafe_alert(
     - recibe una alerta del agente Cafe;
     - valida product_variant y severidad;
     - guarda la alerta en cafe_alerts;
-    - no modifica tablas del LSC original;
-    - no envía Telegram todavía.
+    - envía Telegram para warning/critical;
+    - no modifica tablas ni endpoints del LSC original.
     """
 
     _validate_cafe_alert_payload(payload)
 
     now = _utc_now()
     data = payload_to_dict(payload)
+    telegram_sent = False
 
     try:
         alert = CafeAlert(
@@ -408,26 +496,39 @@ def cafe_alert(
         db.commit()
         db.refresh(alert)
 
+        if payload.severity in {"warning", "critical"}:
+            telegram_sent = _send_cafe_telegram_alert(payload)
+
+            if telegram_sent:
+                alert.status = "telegram_sent"
+            else:
+                alert.status = "telegram_failed"
+
+            db.commit()
+            db.refresh(alert)
+
     except Exception as exc:
         db.rollback()
-        print(f"[LSC_Cafe] Error guardando alerta: {exc}")
+        print(f"[LSC_Cafe] Error guardando/enviando alerta: {exc}")
         raise HTTPException(
             status_code=500,
-            detail="Error interno guardando alerta LSC_Cafe.",
+            detail="Error interno procesando alerta LSC_Cafe.",
         )
 
     print(
-        "[LSC_Cafe] Alerta guardada | "
+        "[LSC_Cafe] Alerta procesada | "
         f"cliente={payload.client_name} | "
         f"sucursal={payload.branch_name} | "
         f"equipo={payload.device_alias} | "
         f"severity={payload.severity} | "
-        f"event_type={payload.event_type}"
+        f"event_type={payload.event_type} | "
+        f"status={alert.status} | "
+        f"telegram_sent={telegram_sent}"
     )
 
     return {
         "ok": True,
-        "message": "Alerta LSC_Cafe recibida y persistida correctamente.",
+        "message": "Alerta LSC_Cafe recibida y procesada correctamente.",
         "alert_id": alert.id,
         "product_variant": payload.product_variant,
         "client_name": payload.client_name,
@@ -441,5 +542,6 @@ def cafe_alert(
         "event_type": payload.event_type,
         "event_title": payload.event_title,
         "status": alert.status,
+        "telegram_sent": telegram_sent,
         "created_at_utc": alert.created_at.isoformat() + "Z",
     }
